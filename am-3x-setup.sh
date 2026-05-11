@@ -1,7 +1,7 @@
 #!/bin/bash
 # ============================================================
 # am-3x — Автоматическая настройка маршрутизации Amnezia через 3x-ui
-# Версия: 2.1
+# Версия: 2.2
 # Запуск: bash am-3x-setup.sh
 # Удаление: bash am-3x-setup.sh --uninstall
 # Требования: Docker, 3x-ui, root
@@ -9,8 +9,9 @@
 # Что делает:
 #   Перехватывает TCP трафик контейнеров Amnezia через NAT REDIRECT
 #   и направляет в xray (dokodemo-door) → VLESS outbound.
-#   UDP идёт напрямую (без прокси) — это важно для QUIC/HTTP3
-#   (YouTube, Instagram и др. используют UDP:443 для видео).
+#   QUIC (UDP:443) блокируется чтобы приложения использовали TCP.
+#   Это обеспечивает полную маршрутизацию: YouTube, Instagram,
+#   стриминг — всё через прокси.
 # ============================================================
 
 set -euo pipefail
@@ -51,7 +52,7 @@ if [[ "${1:-}" == "--uninstall" ]]; then
     iptables -t nat -F AMNEZIA_REDIRECT 2>/dev/null || true
     iptables -t nat -X AMNEZIA_REDIRECT 2>/dev/null || true
 
-    # Удаляем MASQUERADE для подсети
+    # Удаляем MASQUERADE
     for iface in $(iptables -t nat -L POSTROUTING -n -v 2>/dev/null | grep "$SUBNET" | awk '{print $7}' | sort -u); do
         iptables -t nat -D POSTROUTING -s "$SUBNET" -o "!$iface" -j MASQUERADE 2>/dev/null || true
     done
@@ -63,7 +64,7 @@ if [[ "${1:-}" == "--uninstall" ]]; then
     systemctl daemon-reload 2>/dev/null || true
 
     msg_ok "iptables правила удалены"
-    msg_warn "dokodemo-door inbound НЕ удалён — удали вручную в 3x-ui если нужно"
+    msg_warn "dokodemo-door inbound и routing rules НЕ удалены — удали вручную в 3x-ui если нужно"
     echo -e "\n${GREEN}✅ am-3x удалён${NC}"
     exit 0
 fi
@@ -296,7 +297,9 @@ echo -e "  ${BOLD}dokodemo-door:${NC}  0.0.0.0:$DOKO_PORT"
 echo -e "  ${BOLD}Outbound:${NC}       $OTAG → $OADDR:${OPORT}"
 echo ""
 echo -e "  ${CYAN}TCP → через прокси ($OTAG)${NC}"
-echo -e "  ${CYAN}UDP → напрямую (без прокси)${NC}"
+echo -e "  ${CYAN}QUIC (UDP:443) → заблокирован (приложения используют TCP)${NC}"
+echo -e "  ${CYAN}Остальной UDP → напрямую${NC}"
+echo ""
 echo -e "  ${YELLOW}Весь TCP трафик контейнеров пойдёт через $OTAG${NC}"
 echo ""
 
@@ -327,7 +330,7 @@ RESP=$(curl -sk "${XUI_BASE}panel/api/inbounds/add" -X POST \
             settings:"{\"network\":\"tcp,udp\",\"followRedirect\":true}",
             streamSettings:"{\"network\":\"tcp\"}",
             tag:"transparent-proxy",
-            sniffing:"{\"enabled\":true,\"destOverride\":[\"http\",\"tls\"]}",
+            sniffing:"{\"enabled\":true,\"destOverride\":[\"http\",\"tls\",\"quic\"],\"routeOnly\":false,\"metadataOnly\":false}",
             remark:"am-3x-transparent-proxy"
         }'
     )" 2>/dev/null)
@@ -340,9 +343,9 @@ else
 fi
 
 # ═══════════════════════════════════════════════════════════
-# 8. Настройка DNS в шаблоне xray
+# 8. Настройка DNS и routing в шаблоне xray
 # ═══════════════════════════════════════════════════════════
-msg_step "8. Настройка DNS"
+msg_step "8. Настройка DNS и routing"
 
 python3 << PYDNS
 import sqlite3, json
@@ -353,13 +356,51 @@ if r:
     t = json.loads(r[0])
     changed = False
 
+    # DNS
     if not t.get("dns") or t.get("dns") is None:
         t["dns"] = {"servers": ["1.1.1.1", "8.8.8.8", "localhost"]}
         changed = True
 
+    # domainStrategy
     if t.get("routing", {}).get("domainStrategy") != "IPIfNonMatch":
         t.setdefault("routing", {})["domainStrategy"] = "IPIfNonMatch"
         changed = True
+
+    # Routing rules: QUIC block BEFORE general proxy rule
+    rules = t["routing"]["rules"]
+    
+    # Remove existing QUIC blocks and our custom rules
+    rules = [r for r in rules if r.get("outboundTag") == "api"]
+    
+    # 1. QUIC block (MUST be before general proxy rule!)
+    rules.append({
+        "type": "field",
+        "outboundTag": "blocked",
+        "port": "443",
+        "network": "udp",
+        "inboundTag": ["dokodemo-door"]
+    })
+    # 2. General proxy rule
+    rules.append({
+        "type": "field",
+        "inboundTag": ["dokodemo-door"],
+        "outboundTag": "$OTAG"
+    })
+    # 3. Private IP block
+    rules.append({
+        "type": "field",
+        "outboundTag": "blocked",
+        "ip": ["geoip:private"]
+    })
+    # 4. Bittorrent block
+    rules.append({
+        "type": "field",
+        "outboundTag": "blocked",
+        "protocol": ["bittorrent"]
+    })
+    
+    t["routing"]["rules"] = rules
+    changed = True
 
     if changed:
         c.execute("UPDATE settings SET value=? WHERE key='xrayTemplateConfig'", (json.dumps(t, ensure_ascii=False),))
@@ -397,8 +438,7 @@ fi
 # ═══════════════════════════════════════════════════════════
 msg_step "10. Настройка iptables"
 
-# --- TCP: NAT REDIRECT ---
-msg_info "TCP: NAT REDIRECT → :$DOKO_PORT (UDP идёт напрямую)"
+msg_info "TCP: NAT REDIRECT → :$DOKO_PORT"
 
 iptables -t nat -N AMNEZIA_REDIRECT 2>/dev/null || iptables -t nat -F AMNEZIA_REDIRECT
 
@@ -408,19 +448,17 @@ iptables -t nat -A AMNEZIA_REDIRECT -d 172.16.0.0/12 -j RETURN
 iptables -t nat -A AMNEZIA_REDIRECT -d 192.168.0.0/16 -j RETURN
 iptables -t nat -A AMNEZIA_REDIRECT -d 169.254.0.0/16 -j RETURN
 
-# Исключаем outbound сервер (чтобы не было петли)
 if [[ -n "$OIP" ]]; then
     iptables -t nat -A AMNEZIA_REDIRECT -d "$OIP" -j RETURN
 fi
 
 iptables -t nat -A AMNEZIA_REDIRECT -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
 
-# Только TCP → REDIRECT
 iptables -t nat -A AMNEZIA_REDIRECT -p tcp -j REDIRECT --to-port "$DOKO_PORT"
 
 iptables -t nat -D PREROUTING -s "$SUBNET" -j AMNEZIA_REDIRECT 2>/dev/null || true
 iptables -t nat -A PREROUTING -s "$SUBNET" -j AMNEZIA_REDIRECT
-msg_ok "NAT REDIRECT (только TCP)"
+msg_ok "NAT REDIRECT (TCP через прокси, QUIC заблокирован в xray routing)"
 
 # --- MASQUERADE ---
 if [[ -n "$CUSTOM_NET" ]]; then
@@ -432,7 +470,7 @@ else
 fi
 msg_ok "MASQUERADE"
 
-# --- TCP MSS clamping (для туннелей с меньшим MTU) ---
+# --- TCP MSS clamping ---
 iptables -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || \
     iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 msg_ok "TCP MSS clamping"
@@ -447,7 +485,7 @@ msg_ok "/etc/iptables.rules"
 
 cat > /etc/rc.local << RCEOF
 #!/bin/bash
-# am-3x v2.1: restore iptables (TCP NAT REDIRECT only, UDP direct)
+# am-3x v2.2: TCP NAT REDIRECT + QUIC blocked in xray routing
 iptables-restore < /etc/iptables.rules
 exit 0
 RCEOF
@@ -506,7 +544,7 @@ fi
 # ═══════════════════════════════════════════════════════════
 echo ""
 echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${GREEN}  ✅ am-3x v2.1 настроен!${NC}"
+echo -e "${GREEN}  ✅ am-3x v2.2 настроен!${NC}"
 echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo ""
 echo -e "  ${BOLD}Контейнеры:${NC}     ${#CONTAINERS[@]} шт."
@@ -516,7 +554,8 @@ echo -e "  ${BOLD}dokodemo-door:${NC}  0.0.0.0:$DOKO_PORT"
 echo -e "  ${BOLD}Outbound:${NC}       $OTAG → $OADDR:${OPORT}"
 echo ""
 echo -e "  ${CYAN}TCP → прокси ($OTAG)${NC}"
-echo -e "  ${CYAN}UDP → напрямую (QUIC/HTTP3 работает без прокси)${NC}"
+echo -e "  ${CYAN}QUIC (UDP:443) → заблокирован (приложения → TCP)${NC}"
+echo -e "  ${CYAN}Остальной UDP → напрямую${NC}"
 echo ""
 echo -e "  ${YELLOW}⚠️  Порты для проброса на роутере:${NC}"
 for c in "${CONTAINERS[@]}"; do
@@ -527,6 +566,9 @@ echo ""
 echo -e "  ${DIM}Лог установки: $LOG${NC}"
 echo -e "  ${DIM}Удалить: sudo bash am-3x-setup.sh --uninstall${NC}"
 echo ""
-echo -e "  ${CYAN}Важно:${NC} в панели 3x-ui → Routing убедись что правило"
-echo -e "  ${CYAN}transparent-proxy → $OTAG стоит ПЕРЕД catch-all правилом${NC}"
+echo -e "  ${YELLOW}Важно:${NC} routing rules в 3x-ui должны быть в таком порядке:"
+echo -e "  ${YELLOW}  1. QUIC block (UDP:443 → blocked)${NC}"
+echo -e "  ${YELLOW}  2. dokodemo-door → $OTAG${NC}"
+echo -e "  ${YELLOW}  3. private IP → blocked${NC}"
+echo -e "  ${YELLOW}Если порядок неправильный — QUIC не заблокируется!${NC}"
 echo ""

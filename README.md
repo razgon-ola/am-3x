@@ -1,52 +1,49 @@
-# am-3x — Маршрутизация Amnezia VPN через 3x-ui
+# am-3x — Amnezia VPN → 3x-ui transparent proxy
 
-Автоматический скрипт для настройки прозрачного проксирования TCP трафика Docker-контейнеров Amnezia VPN через 3x-ui/xray.
+Автоматическая настройка маршрутизации **всего TCP трафика** из Docker контейнеров AmneziaVPN через outbound 3x-ui (xray).
 
-## Что делает
-
-Скрипт настраивает маршрутизацию так, что весь **TCP** трафик клиентов Amnezia VPN (подключённых через WireGuard/AWG контейнеры) проходит через прокси 3x-ui/xray, а **UDP** идёт напрямую. Это обеспечивает:
-
-- 🌐 Скрытие IP клиентов за прокси-сервером
-- 📺 Работу QUIC/HTTP3 (YouTube, Instagram, стриминг) — UDP не блокируется
-- 📱 Полная совместимость с мобильными приложениями
-- 🔄 Автоматическое переключение outbound в панели 3x-ui
-
-## Архитектура
+## Как работает
 
 ```
-Мобильные клиенты
-  ↓ (Amnezia WireGuard)
-Docker контейнеры (amnezia-awg)
-  ↓ TCP ──────────────────────→ iptables NAT REDIRECT
-  ↓                                    ↓
-  ↓                            xray dokodemo-door :12747
-  ↓                                    ↓
-  ↓                            VLESS/VMess outbound
-  ↓                                    ↓
-  ↓                            Удалённый сервер
-  ↓
-  └─── UDP ──→ напрямую (QUIC/HTTP3 для видео)
+Телефон/ПК → AmneziaWG (Docker) → iptables NAT REDIRECT → xray dokodemo-door → VLESS/VMess outbound → Интернет
 ```
+
+- **TCP** → проксируется через выбранный outbound (VLESS, VMess, Trojan и т.д.)
+- **QUIC (UDP:443)** → заблокирован в xray routing (приложения автоматически переходят на TCP)
+- **Остальной UDP** → идёт напрямую
+
+## Результат
+
+✅ YouTube, Instagram, стриминг — всё работает через прокси
+✅ Автоматический интерактивный скрипт настройки
+✅ Поддержка нескольких контейнеров Amnezia и нескольких outbound'ов
 
 ## Требования
 
-- Сервер с установленным **Docker**
-- **3x-ui** панель с настроенным outbound (VLESS/VMess/Trojan)
-- **Amnezia VPN** контейнеры (AmneziaWG)
-- **Root** доступ
+- Linux сервер с root доступом
+- Docker + Docker Compose
+- 3x-ui панель (с настроенным outbound)
+- Контейнеры AmneziaVPN (AmneziaWG)
 
-## Быстрая установка
-
-```bash
-curl -sL https://parser.marasanov.com/am-3x-setup.sh | sudo bash
-```
-
-Или скачай и запусти вручную:
+## Установка
 
 ```bash
-wget https://raw.githubusercontent.com/razgon-ola/am-3x/main/am-3x-setup.sh
+# Скачать и запустить
+curl -fsSL https://parser.marasanov.com/am-3x-setup.sh | sudo bash
+
+# Или вручную
+wget https://parser.marasanov.com/am-3x-setup.sh
 sudo bash am-3x-setup.sh
 ```
+
+Скрипт автоматически:
+1. Найдёт контейнеры Amnezia и их подсеть
+2. Подключится к 3x-ui API
+3. Предложит выбрать outbound
+4. Создаст dokodemo-door inbound
+5. Настроит routing rules (QUIC block + proxy)
+6. Настроит iptables (NAT REDIRECT)
+7. Сохранит правила для перезагрузки
 
 ## Удаление
 
@@ -54,72 +51,32 @@ sudo bash am-3x-setup.sh
 sudo bash am-3x-setup.sh --uninstall
 ```
 
-## Как работает скрипт
-
-Скрипт автоматически:
-
-1. **Находит** Docker контейнеры Amnezia (по имени)
-2. **Определяет** подсеть и Docker сеть
-3. **Подключается** к API 3x-ui (автоматический сброс пароля при необходимости)
-4. **Определяет** outbound серверы (интерактивный выбор при нескольких)
-5. **Создаёт** dokodemo-door inbound в 3x-ui
-6. **Настраивает** DNS в шаблоне xray
-7. **Настраивает** iptables NAT REDIRECT для TCP
-8. **Настраивает** TCP MSS clamping для туннелей
-9. **Сохраняет** правила (iptables.rules + rc.local + systemd)
-10. **Проверяет** работу (IP тест из контейнера)
-
 ## Переменные окружения
 
 | Переменная | Описание | По умолчанию |
 |---|---|---|
-| `AM3X_DOKO_PORT` | Порт dokodemo-door | `12747` |
-| `AM3X_PASSWORD` | Пароль 3x-ui (без интерактивного ввода) | `admin` |
+| `AM3X_DOKO_PORT` | Порт dokodemo-door | 12747 |
+| `AM3X_PASSWORD` | Пароль 3x-ui (без запроса) | — |
 
-Пример неинтерактивного запуска:
+## Важно
 
-```bash
-AM3X_PASSWORD="your_password" bash am-3x-setup.sh
-```
+Routing rules в 3x-ui должны быть в таком порядке:
+1. **QUIC block** (UDP:443 → blocked) — ДО общего правила!
+2. **dokodemo-door → outbound**
+3. **Private IP → blocked**
 
-## Смена outbound
+Если QUIC block стоит после прокси-правила — YouTube/Instagram видео работать не будут!
 
-В панели 3x-ui → **Routing** → найди правило для `transparent-proxy` → выбери другой **Outbound tag**. Трафик мгновенно переключится на новый outbound.
+## Версии
 
-## Решение проблем
+### v2.2 (текущая)
+- TCP через NAT REDIRECT → xray → outbound
+- QUIC (UDP:443) заблокирован в xray routing
+- Остальной UDP напрямую
+- YouTube, Instagram, стриминг работают ✅
 
-### Контейнеры не найдены
-
-Контейнеры должны содержать `amnezia` в названии. Если название другое:
-
-```bash
-docker ps  # посмотри названия
-# Переименуй или создай контейнер с правильным именем
-```
-
-### TCP не проксируется
-
-1. Проверь routing rules в 3x-ui — правило `transparent-proxy → outbound` должно быть **перед** catch-all
-2. Проверь что dokodemo-door слушает: `ss -tlnp | grep 12747`
-3. Проверь iptables: `iptables -t nat -L AMNEZIA_REDIRECT -n -v`
-
-### Мобильные клиенты не подключаются
-
-- Проверь что UDP порты Amnezia проброшены на роутере
-- Проверь `docker port <container>` — порты должны быть видны
-
-### YouTube/Instagram не работает
-
-- Убедись что UDP **не** проксируется (скрипт v2.1 не проксирует UDP)
-- Если обновляешься с v1.x — удали старые TPROXY правила: `sudo bash am-3x-setup.sh --uninstall` и запусти заново
-
-## Поддерживаемые outbound протоколы
-
-- VLESS + Reality
-- VLESS + XHTTP
-- VMess + WebSocket
-- Trojan
-- Любые другие, поддерживаемые xray-core
+### v2.1
+- TCP через NAT REDIRECT (UDP напрямую, не проксируется)
 
 ## Лицензия
 
